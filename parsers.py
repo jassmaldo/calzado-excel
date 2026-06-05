@@ -460,7 +460,19 @@ def _docx_tables_rows(path):
 
 def parse_grendene(invoice_path, packing_path):
     """
-    GRENDENE: invoice y packing en .docx con 100+ mini-tablas.
+    Dispatcher: detecta formato v1 (100+ mini-tablas) o v2 (tabla única grande)
+    y llama al parser correcto.
+    """
+    import docx as _docx
+    d = _docx.Document(invoice_path)
+    if len(d.tables) <= 15:
+        return _parse_grendene_v2(invoice_path, packing_path)
+    return _parse_grendene_v1(invoice_path, packing_path)
+
+
+def _parse_grendene_v1(invoice_path, packing_path):
+    """
+    GRENDENE v1: invoice y packing en .docx con 100+ mini-tablas.
     - Modelo = número del modelo (ej 18060)
     - Cód. Color = código de artículo (ej 90984)
     - Marca = primera palabra del nombre del modelo (GRENDHA, ZAXY, ...)
@@ -538,6 +550,139 @@ def parse_grendene(invoice_path, packing_path):
                 'dist': dist,
                 'precio': precio,
             })
+
+    return items, {'marca': None, 'marca_archivo': 'GRENDENE',
+                   'tallas': None, 'dist': None, 'por_linea_marca': True}
+
+
+def _parse_grendene_v2(invoice_path, packing_path):
+    """
+    GRENDENE v2: invoice y packing en .docx con UNA tabla grande (128 filas).
+    Estructura tabla principal:
+      Col 0: cajas | Col 1: pares | Col 4: 'PRS - COLOR' o header modelo
+      Col 6: '- COD_COLOR' | Col 7: tabla_code | Col 10: precio_unit | Col 13: total
+    Tabla de curvas (tabla índice 4):
+      'TABLA Bra FEM 33/34 35 35/36 36 37 38 39 39/40 40 TOTAL'
+      '02079      2      3  -    3  3   1  -   -    -   12'
+    """
+    import docx as _docx
+
+    def _num(s):
+        try:
+            return float(s.replace('.', '').replace(',', '.'))
+        except Exception:
+            return None
+
+    # --- Leer curvas de tallas desde ambas tablas de curvas (FEM y KID) ---
+    curves = {}       # tabla_code -> {'tallas': [...], 'dist': [...]}
+    for doc_path in (invoice_path, packing_path):
+        d = _docx.Document(doc_path)
+        for t in d.tables:
+            # Buscar tabla que empiece con 'TABLA'
+            if not t.rows:
+                continue
+            header_text = t.rows[0].cells[0].text.strip()
+            if not header_text.startswith('TABLA'):
+                continue
+            # Determinar si es FEM o KID y extraer nombres de tallas
+            # Header ej: 'TABLA       Bra FEM 33/34  35  35/36  36  37  38  39  39/40  40   TOTAL'
+            raw_hdr = re.sub(r'\s+', ' ', header_text).strip()
+            # Tallas: todo entre 'FEM' o 'KID' y 'TOTAL'
+            m = re.search(r'(?:FEM|KID)\s+(.+?)\s+TOTAL', raw_hdr)
+            if not m:
+                continue
+            talla_names = m.group(1).split()
+            for row in t.rows[1:]:
+                cells = [c.text.strip() for c in row.cells]
+                row_text = re.sub(r'\s+', ' ', cells[0]).strip()
+                parts = row_text.split()
+                if not parts or not re.match(r'^\d{5}$', parts[0]):
+                    continue
+                code = parts[0]
+                vals = parts[1:]
+                tallas, dist = [], []
+                for tn, v in zip(talla_names, vals):
+                    if v != '-' and v.isdigit():
+                        tallas.append(tn)
+                        dist.append(v)
+                if tallas:
+                    curves[code] = {'tallas': tallas, 'dist': dist}
+        break  # basta con el invoice para las curvas
+
+    # --- Leer items de la tabla principal del invoice ---
+    d = _docx.Document(invoice_path)
+    # Tabla con datos es la que tiene 'PRS' en alguna celda de los primeros items
+    data_table = None
+    for t in d.tables:
+        for row in t.rows[:20]:
+            if any('PRS' in (c.text or '') for c in row.cells):
+                data_table = t
+                break
+        if data_table:
+            break
+
+    if not data_table:
+        return [], {'marca': None, 'marca_archivo': 'GRENDENE',
+                    'tallas': None, 'dist': None, 'por_linea_marca': True}
+
+    items = []
+    current_modelo = ''
+    current_marca  = ''
+
+    for row in data_table.rows:
+        cells = [c.text.strip() for c in row.cells]
+        desc = cells[4] if len(cells) > 4 else ''
+
+        # ── Cabecera de modelo: '(18060) - GRENDHA + ACAI ENERGIA FEM' ──
+        mh = re.match(r'\((\d+)\)\s*-\s*(.+)', desc)
+        if mh:
+            current_modelo = mh.group(1)
+            nombre = _clean(mh.group(2))
+            current_marca = nombre.split()[0] if nombre else 'GRENDENE'
+            continue
+
+        # ── Fila de item: 'PRS - COLOR' ──
+        if not desc.startswith('PRS'):
+            continue
+        color = re.sub(r'^PRS\s*-\s*', '', desc).strip()
+
+        cod_color_raw = cells[6] if len(cells) > 6 else ''
+        cod_color = cod_color_raw.lstrip('- ').strip()
+
+        tabla_code = cells[7] if len(cells) > 7 else ''
+
+        try:
+            cajas = int(cells[0])
+        except Exception:
+            cajas = 0
+        try:
+            pares = int(cells[1].replace('.', ''))
+        except Exception:
+            pares = 0
+
+        precio = 0.0
+        for ci in (10, 11, 12):
+            v = _num(cells[ci]) if len(cells) > ci else None
+            if v and 0.5 < v < 500:
+                precio = v
+                break
+
+        curve = curves.get(tabla_code, {})
+        tallas = curve.get('tallas', [])
+        dist   = curve.get('dist', [])
+
+        items.append({
+            'ref':               current_modelo,
+            'modelo_forzado':    current_modelo,
+            'cod_color_forzado': cod_color,
+            'color':             color,
+            'marca_linea':       current_marca,
+            'cajas':             cajas,
+            'pares':             pares,
+            'tallas':            tallas,
+            'dist':              dist,
+            'precio':            precio,
+        })
 
     return items, {'marca': None, 'marca_archivo': 'GRENDENE',
                    'tallas': None, 'dist': None, 'por_linea_marca': True}
